@@ -78,15 +78,18 @@ if (existsSync(publicPath)) {
   });
 
   // SPA fallback - serve index.html for all non-API routes
-  fastify.setNotFoundHandler(async (request, reply) => {
-    if (request.url.startsWith('/api/') || request.url.startsWith('/ws/') || request.url.startsWith('/health')) {
+  fastify.setNotFoundHandler(async (_request, reply) => {
+    // Use reply.request in case the request param is unused/omitted by TS rules
+    const url = reply.request.url;
+
+    if (url.startsWith('/api/') || url.startsWith('/ws/') || url.startsWith('/health')) {
       return reply.status(404).send({ success: false, error: 'Not found' });
     }
     return reply.sendFile('index.html');
   });
 } else {
   // Development mode - no static files
-  fastify.setNotFoundHandler(async (request, reply) => {
+  fastify.setNotFoundHandler(async (_request, reply) => {
     return reply.status(404).send({ success: false, error: 'Not found' });
   });
 }
@@ -94,35 +97,35 @@ if (existsSync(publicPath)) {
 // Global error handler
 fastify.setErrorHandler(async (error, request, reply) => {
   fastify.log.error({ err: error, requestId: request.id }, 'Request error');
-  
+
   // Handle validation errors
-  if (error.validation) {
+  if ((error as any).validation) {
     return reply.status(400).send({
       success: false,
       error: 'Validation error',
-      details: error.validation,
+      details: (error as any).validation,
     });
   }
 
   // Handle known errors
-  if (error.statusCode) {
-    return reply.status(error.statusCode).send({
+  if ((error as any).statusCode) {
+    return reply.status((error as any).statusCode).send({
       success: false,
-      error: error.message,
+      error: (error as any).message,
     });
   }
 
   // Unknown errors
   return reply.status(500).send({
     success: false,
-    error: config.isProduction ? 'Internal server error' : error.message,
+    error: config.isProduction ? 'Internal server error' : (error as any).message,
   });
 });
 
 // Graceful shutdown
 const shutdown = async (signal: string) => {
   fastify.log.info(`Received ${signal}, shutting down gracefully...`);
-  
+
   try {
     await fastify.close();
     await disconnectDatabase();
@@ -164,9 +167,9 @@ const start = async () => {
 ╔═══════════════════════════════════════════════════════════╗
 ║                      LiveDrops Server                      ║
 ╠═══════════════════════════════════════════════════════════╣
-║  🚀 Server running on http://localhost:${config.port.toString().padEnd(4)}               ║
-║  📊 Environment: ${config.nodeEnv.padEnd(11)}                            ║
-║  🔗 App Origin: ${config.appOrigin.substring(0, 30).padEnd(30)}       ║
+║  Server running on http://localhost:${config.port.toString().padEnd(4)}               ║
+║  Environment: ${config.nodeEnv.padEnd(11)}                            ║
+║  App Origin: ${config.appOrigin.substring(0, 30).padEnd(30)}       ║
 ╚═══════════════════════════════════════════════════════════╝
     `);
   } catch (error) {

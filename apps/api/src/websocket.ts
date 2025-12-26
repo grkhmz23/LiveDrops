@@ -17,7 +17,7 @@ export function broadcastToOverlay(slug: string, message: OverlayMessage): void 
   if (!clients) return;
 
   const messageStr = JSON.stringify(message);
-  
+
   for (const client of clients) {
     if (client.readyState === WebSocket.OPEN) {
       client.send(messageStr);
@@ -34,9 +34,12 @@ export async function registerWebSocketRoutes(fastify: FastifyInstance): Promise
   fastify.get<{
     Params: { slug: string };
   }>('/ws/overlay/:slug', { websocket: true }, (connection, request) => {
-    const ws = connection.socket;
+    // Depending on fastify-websocket version/typing, `connection` may be:
+    // - a wrapper with `.socket`, or
+    // - the raw WebSocket instance.
+    const ws: WebSocket = ((connection as any).socket ?? connection) as WebSocket;
     const slug = request.params.slug;
-    
+
     // Add client to the set for this drop
     if (!overlayClients.has(slug)) {
       overlayClients.set(slug, new Set());
@@ -46,16 +49,18 @@ export async function registerWebSocketRoutes(fastify: FastifyInstance): Promise
     console.log(`[WebSocket] Overlay client connected for drop: ${slug}`);
 
     // Send initial connection confirmation
-    ws.send(JSON.stringify({
-      type: 'CONNECTED',
-      data: { slug },
-    }));
+    ws.send(
+      JSON.stringify({
+        type: 'CONNECTED',
+        data: { slug },
+      }),
+    );
 
     // Handle incoming messages (ping/pong for keepalive)
-    ws.on('message', (message) => {
+    ws.on('message', (message: any) => {
       try {
         const data = JSON.parse(message.toString());
-        if (data.type === 'PING') {
+        if (data?.type === 'PING') {
           ws.send(JSON.stringify({ type: 'PONG' }));
         }
       } catch {
@@ -76,7 +81,7 @@ export async function registerWebSocketRoutes(fastify: FastifyInstance): Promise
     });
 
     // Handle errors
-    ws.on('error', (error) => {
+    ws.on('error', (error: any) => {
       console.error(`[WebSocket] Error for drop ${slug}:`, error);
     });
   });

@@ -6,16 +6,46 @@ import { ttsActionSchema, voteActionSchema, publicKeySchema } from '../utils/val
 import { sanitizeTtsMessage } from '../utils/sanitize.js';
 import { broadcastToOverlay } from '../websocket.js';
 
+/**
+ * Safely parse JSON, returning null on failure
+ */
+function safeJsonParse<T>(json: string): T | null {
+  try {
+    return JSON.parse(json) as T;
+  } catch {
+    return null;
+  }
+}
+
+function getGroupCount(row: any): number {
+  const c = row?._count;
+  if (typeof c === 'number') return c;
+  if (c && typeof c === 'object') {
+    const v = (c as any)._all;
+    if (typeof v === 'number') return v;
+  }
+  return 0;
+}
+
+function truncateWallet(maybeWallet: unknown): string {
+  if (typeof maybeWallet !== 'string') return '';
+  if (maybeWallet.length <= 12) return maybeWallet;
+  return `${maybeWallet.slice(0, 4)}...${maybeWallet.slice(-4)}`;
+}
+
+function getMaxTtsLength(): number {
+  const maybe = (config as any)?.viewer?.maxTtsMessageLength;
+  const n = typeof maybe === 'number' ? maybe : Number.parseInt(String(maybe ?? ''), 10);
+  return Number.isFinite(n) && n > 0 ? n : 200;
+}
+
 export const viewerRoutes: FastifyPluginAsync = async (fastify) => {
-  // Rate limit viewer actions
-  fastify.register(import('@fastify/rate-limit'), {
+  /**
+   * Basic rate limiting for viewer endpoints
+   */
+  await fastify.register(import('@fastify/rate-limit'), {
     max: config.rateLimit.action.max,
     timeWindow: config.rateLimit.action.windowMs,
-    keyGenerator: (request) => {
-      // Rate limit by wallet address if provided, otherwise by IP
-      const body = request.body as Record<string, unknown>;
-      return (body?.viewerWallet as string) || request.ip;
-    },
   });
 
   /**
@@ -25,11 +55,12 @@ export const viewerRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.get<{
     Params: { slug: string };
   }>('/:slug', async (request, reply) => {
-    const drop = await prisma.drop.findUnique({
+    const drop = await prisma.drop.findFirst({
       where: { slug: request.params.slug },
       include: {
         polls: {
           where: { isActive: true },
+          orderBy: { createdAt: 'desc' },
           take: 1,
         },
       },
@@ -43,12 +74,16 @@ export const viewerRoutes: FastifyPluginAsync = async (fastify) => {
     }
 
     // Get vote counts for active poll
-    let pollWithVotes = null;
+    let pollWithVotes: null | {
+      id: string;
+      question: string;
+      options: Array<{ text: string; votes: number }>;
+    } = null;
+
     if (drop.polls.length > 0) {
       const poll = drop.polls[0];
-      const options = JSON.parse(poll.options) as string[];
-      
-      // Get vote counts per option
+      const options = safeJsonParse<string[]>(poll.options) ?? [];
+
       const votes = await prisma.action.groupBy({
         by: ['payloadJson'],
         where: {
@@ -60,13 +95,15 @@ export const viewerRoutes: FastifyPluginAsync = async (fastify) => {
 
       const voteCounts = new Array(options.length).fill(0);
       for (const vote of votes) {
-        try {
-          const payload = JSON.parse(vote.payloadJson) as { optionIndex: number };
-          if (payload.optionIndex >= 0 && payload.optionIndex < options.length) {
-            voteCounts[payload.optionIndex] = vote._count;
-          }
-        } catch {
-          // Ignore invalid vote data
+        const payload = safeJsonParse<{ optionIndex: number; pollId?: string }>(vote.payloadJson);
+        if (
+          payload &&
+          payload.pollId === poll.id &&
+          typeof payload.optionIndex === 'number' &&
+          payload.optionIndex >= 0 &&
+          payload.optionIndex < options.length
+        ) {
+          voteCounts[payload.optionIndex] += getGroupCount(vote);
         }
       }
 
@@ -97,43 +134,33 @@ export const viewerRoutes: FastifyPluginAsync = async (fastify) => {
         name: drop.name,
         symbol: drop.symbol,
         description: drop.description,
-        imageUrl: drop.imageUrl,
         tokenMint: drop.tokenMint,
         status: drop.status,
         holderThresholdRaw: drop.holderThresholdRaw,
-        activePoll: pollWithVotes,
-        recentTts: recentTts.map(t => {
-          const payload = JSON.parse(t.payloadJson) as { message: string };
+        bagsUrl: drop.tokenMint ? `https://bags.fm/${drop.tokenMint}` : null,
+        poll: pollWithVotes,
+        recentTts: recentTts.map((t: any) => {
+          const payload = safeJsonParse<{ message?: string }>(t.payloadJson);
           return {
             id: t.id,
-            message: payload.message,
-            viewerWallet: t.viewerWallet.slice(0, 4) + '...' + t.viewerWallet.slice(-4),
+            viewerWallet: truncateWallet(t.viewerWallet),
+            message: payload?.message ?? '',
             createdAt: t.createdAt,
           };
         }),
-        bagsUrl: drop.tokenMint ? `https://bags.fm/${drop.tokenMint}` : null,
       },
     };
   });
 
   /**
    * POST /api/viewer/:slug/check-holding
-   * Check if a wallet holds enough tokens
+   * Check if viewer meets holder threshold (public)
    */
   fastify.post<{
     Params: { slug: string };
     Body: { viewerWallet: string };
   }>('/:slug/check-holding', async (request, reply) => {
-    const walletResult = publicKeySchema.safeParse(request.body.viewerWallet);
-    
-    if (!walletResult.success) {
-      return reply.status(400).send({
-        success: false,
-        error: 'Invalid wallet address',
-      });
-    }
-
-    const drop = await prisma.drop.findUnique({
+    const drop = await prisma.drop.findFirst({
       where: { slug: request.params.slug },
     });
 
@@ -144,64 +171,58 @@ export const viewerRoutes: FastifyPluginAsync = async (fastify) => {
       });
     }
 
-    if (drop.status !== 'LAUNCHED' || !drop.tokenMint) {
+    const walletResult = publicKeySchema.safeParse(request.body.viewerWallet);
+    if (!walletResult.success) {
+      return reply.status(400).send({
+        success: false,
+        error: 'Invalid viewer wallet',
+      });
+    }
+
+    if (!drop.tokenMint || drop.status !== 'LAUNCHED') {
       return reply.status(400).send({
         success: false,
         error: 'Drop is not launched yet',
       });
     }
 
-    try {
-      const meetsThreshold = await checkHolderThreshold(
-        request.body.viewerWallet,
-        drop.tokenMint,
-        drop.holderThresholdRaw
-      );
+    const meetsThreshold = await checkHolderThreshold(walletResult.data, drop.tokenMint, drop.holderThresholdRaw);
 
-      return {
-        success: true,
-        data: {
-          meetsThreshold,
-          requiredAmount: drop.holderThresholdRaw,
-          tokenMint: drop.tokenMint,
-        },
-      };
-    } catch (error) {
-      console.error('Error checking token balance:', error);
-      return reply.status(500).send({
-        success: false,
-        error: 'Failed to check token balance',
-      });
-    }
+    return {
+      success: true,
+      data: {
+        meetsThreshold,
+        requiredAmount: drop.holderThresholdRaw,
+      },
+    };
   });
 
   /**
    * POST /api/viewer/:slug/tts
-   * Submit a TTS message
+   * Submit a TTS message (public)
    */
   fastify.post<{
     Params: { slug: string };
     Body: { viewerWallet: string; message: string };
   }>('/:slug/tts', async (request, reply) => {
     const walletResult = publicKeySchema.safeParse(request.body.viewerWallet);
-    const messageResult = ttsActionSchema.safeParse({ message: request.body.message });
-
     if (!walletResult.success) {
       return reply.status(400).send({
         success: false,
-        error: 'Invalid wallet address',
+        error: 'Invalid viewer wallet',
       });
     }
 
+    const messageResult = ttsActionSchema.safeParse({ message: request.body.message });
     if (!messageResult.success) {
       return reply.status(400).send({
         success: false,
-        error: 'Invalid message',
+        error: 'Invalid input',
         details: messageResult.error.flatten(),
       });
     }
 
-    const drop = await prisma.drop.findUnique({
+    const drop = await prisma.drop.findFirst({
       where: { slug: request.params.slug },
     });
 
@@ -219,27 +240,16 @@ export const viewerRoutes: FastifyPluginAsync = async (fastify) => {
       });
     }
 
-    // Check if viewer holds enough tokens
-    const meetsThreshold = await checkHolderThreshold(
-      request.body.viewerWallet,
-      drop.tokenMint,
-      drop.holderThresholdRaw
-    );
-
+    const meetsThreshold = await checkHolderThreshold(walletResult.data, drop.tokenMint, drop.holderThresholdRaw);
     if (!meetsThreshold) {
       return reply.status(403).send({
         success: false,
-        error: 'You need to hold more tokens to submit TTS messages',
+        error: 'You need to hold more tokens to send TTS',
         requiredAmount: drop.holderThresholdRaw,
       });
     }
 
-    // Sanitize message
-    const sanitizedMessage = sanitizeTtsMessage(
-      request.body.message,
-      config.viewer.maxTtsMessageLength
-    );
-
+    const sanitizedMessage = sanitizeTtsMessage(messageResult.data.message, getMaxTtsLength());
     if (!sanitizedMessage) {
       return reply.status(400).send({
         success: false,
@@ -247,23 +257,21 @@ export const viewerRoutes: FastifyPluginAsync = async (fastify) => {
       });
     }
 
-    // Save action
     const action = await prisma.action.create({
       data: {
         dropId: drop.id,
-        viewerWallet: request.body.viewerWallet,
+        viewerWallet: walletResult.data,
         type: 'TTS',
         payloadJson: JSON.stringify({ message: sanitizedMessage }),
       },
     });
 
-    // Broadcast to overlay
     broadcastToOverlay(drop.slug, {
       type: 'TTS',
       data: {
         id: action.id,
+        viewerWallet: truncateWallet(walletResult.data),
         message: sanitizedMessage,
-        viewerWallet: request.body.viewerWallet.slice(0, 4) + '...' + request.body.viewerWallet.slice(-4),
         createdAt: action.createdAt,
       },
     });
@@ -279,38 +287,38 @@ export const viewerRoutes: FastifyPluginAsync = async (fastify) => {
 
   /**
    * POST /api/viewer/:slug/vote
-   * Submit a vote
+   * Submit a vote (public)
    */
   fastify.post<{
     Params: { slug: string };
     Body: { viewerWallet: string; pollId: string; optionIndex: number };
   }>('/:slug/vote', async (request, reply) => {
     const walletResult = publicKeySchema.safeParse(request.body.viewerWallet);
+    if (!walletResult.success) {
+      return reply.status(400).send({
+        success: false,
+        error: 'Invalid viewer wallet',
+      });
+    }
+
     const voteResult = voteActionSchema.safeParse({
       pollId: request.body.pollId,
       optionIndex: request.body.optionIndex,
     });
-
-    if (!walletResult.success) {
-      return reply.status(400).send({
-        success: false,
-        error: 'Invalid wallet address',
-      });
-    }
-
     if (!voteResult.success) {
       return reply.status(400).send({
         success: false,
-        error: 'Invalid vote',
+        error: 'Invalid input',
         details: voteResult.error.flatten(),
       });
     }
 
-    const drop = await prisma.drop.findUnique({
+    const drop = await prisma.drop.findFirst({
       where: { slug: request.params.slug },
       include: {
         polls: {
-          where: { id: request.body.pollId, isActive: true },
+          where: { isActive: true },
+          orderBy: { createdAt: 'desc' },
           take: 1,
         },
       },
@@ -323,6 +331,29 @@ export const viewerRoutes: FastifyPluginAsync = async (fastify) => {
       });
     }
 
+    if (!drop.polls.length) {
+      return reply.status(400).send({
+        success: false,
+        error: 'No active poll',
+      });
+    }
+
+    const poll = drop.polls[0];
+    if (poll.id !== voteResult.data.pollId) {
+      return reply.status(400).send({
+        success: false,
+        error: 'Invalid poll',
+      });
+    }
+
+    const options = safeJsonParse<string[]>(poll.options) ?? [];
+    if (voteResult.data.optionIndex < 0 || voteResult.data.optionIndex >= options.length) {
+      return reply.status(400).send({
+        success: false,
+        error: 'Invalid option index',
+      });
+    }
+
     if (drop.status !== 'LAUNCHED' || !drop.tokenMint) {
       return reply.status(400).send({
         success: false,
@@ -330,30 +361,7 @@ export const viewerRoutes: FastifyPluginAsync = async (fastify) => {
       });
     }
 
-    if (drop.polls.length === 0) {
-      return reply.status(400).send({
-        success: false,
-        error: 'Poll not found or not active',
-      });
-    }
-
-    const poll = drop.polls[0];
-    const options = JSON.parse(poll.options) as string[];
-
-    if (request.body.optionIndex < 0 || request.body.optionIndex >= options.length) {
-      return reply.status(400).send({
-        success: false,
-        error: 'Invalid option index',
-      });
-    }
-
-    // Check if viewer holds enough tokens
-    const meetsThreshold = await checkHolderThreshold(
-      request.body.viewerWallet,
-      drop.tokenMint,
-      drop.holderThresholdRaw
-    );
-
+    const meetsThreshold = await checkHolderThreshold(walletResult.data, drop.tokenMint, drop.holderThresholdRaw);
     if (!meetsThreshold) {
       return reply.status(403).send({
         success: false,
@@ -362,14 +370,13 @@ export const viewerRoutes: FastifyPluginAsync = async (fastify) => {
       });
     }
 
-    // Check if user already voted on this poll
     const existingVote = await prisma.action.findFirst({
       where: {
         dropId: drop.id,
-        viewerWallet: request.body.viewerWallet,
+        viewerWallet: walletResult.data,
         type: 'VOTE',
         payloadJson: {
-          contains: request.body.pollId,
+          contains: `"pollId":"${voteResult.data.pollId}"`,
         },
       },
     });
@@ -381,20 +388,18 @@ export const viewerRoutes: FastifyPluginAsync = async (fastify) => {
       });
     }
 
-    // Save vote
     const action = await prisma.action.create({
       data: {
         dropId: drop.id,
-        viewerWallet: request.body.viewerWallet,
+        viewerWallet: walletResult.data,
         type: 'VOTE',
         payloadJson: JSON.stringify({
-          pollId: request.body.pollId,
-          optionIndex: request.body.optionIndex,
+          pollId: voteResult.data.pollId,
+          optionIndex: voteResult.data.optionIndex,
         }),
       },
     });
 
-    // Get updated vote counts
     const votes = await prisma.action.groupBy({
       by: ['payloadJson'],
       where: {
@@ -406,22 +411,23 @@ export const viewerRoutes: FastifyPluginAsync = async (fastify) => {
 
     const voteCounts = new Array(options.length).fill(0);
     for (const vote of votes) {
-      try {
-        const payload = JSON.parse(vote.payloadJson) as { optionIndex: number; pollId: string };
-        if (payload.pollId === request.body.pollId && payload.optionIndex >= 0 && payload.optionIndex < options.length) {
-          voteCounts[payload.optionIndex] = vote._count;
-        }
-      } catch {
-        // Ignore invalid vote data
+      const payload = safeJsonParse<{ optionIndex: number; pollId: string }>(vote.payloadJson);
+      if (
+        payload &&
+        payload.pollId === voteResult.data.pollId &&
+        typeof payload.optionIndex === 'number' &&
+        payload.optionIndex >= 0 &&
+        payload.optionIndex < options.length
+      ) {
+        voteCounts[payload.optionIndex] += getGroupCount(vote);
       }
     }
 
-    // Broadcast to overlay
     broadcastToOverlay(drop.slug, {
       type: 'VOTE',
       data: {
-        pollId: request.body.pollId,
-        optionIndex: request.body.optionIndex,
+        pollId: voteResult.data.pollId,
+        optionIndex: voteResult.data.optionIndex,
         voteCounts,
       },
     });
@@ -430,7 +436,7 @@ export const viewerRoutes: FastifyPluginAsync = async (fastify) => {
       success: true,
       data: {
         actionId: action.id,
-        optionIndex: request.body.optionIndex,
+        optionIndex: voteResult.data.optionIndex,
         voteCounts,
       },
     };

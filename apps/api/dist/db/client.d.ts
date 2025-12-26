@@ -1,0 +1,8 @@
+import { PrismaClient } from '@prisma/client';
+declare global {
+    var prisma: PrismaClient | undefined;
+}
+export declare const prisma: any;
+export declare function connectDatabase(): Promise<void>;
+export declare function disconnectDatabase(): Promise<void>;
+//# sourceMappingURL=client.d.ts.map

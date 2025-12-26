@@ -4,7 +4,6 @@ import { useWallet } from '@solana/wallet-adapter-react';
 import { WalletMultiButton } from '@solana/wallet-adapter-react-ui';
 import { Card, Spinner } from '../components/Layout';
 import { viewer as viewerApi, ApiError } from '../lib/api';
-import { truncateAddress } from '../lib/solana';
 import type { ViewerData, PollWithVotes } from '../types';
 
 export default function ViewerPage() {

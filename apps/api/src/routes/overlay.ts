@@ -1,19 +1,41 @@
 import { FastifyPluginAsync } from 'fastify';
 import { prisma } from '../db/client.js';
 
+/**
+ * Safely parse JSON, returning null on failure
+ */
+function safeJsonParse<T>(json: string): T | null {
+  try {
+    return JSON.parse(json) as T;
+  } catch {
+    return null;
+  }
+}
+
+function getGroupCount(row: any): number {
+  const c = row?._count;
+  if (typeof c === 'number') return c;
+  if (c && typeof c === 'object') {
+    const v = (c as any)._all;
+    if (typeof v === 'number') return v;
+  }
+  return 0;
+}
+
 export const overlayRoutes: FastifyPluginAsync = async (fastify) => {
   /**
    * GET /api/overlay/:slug
-   * Get overlay data for OBS
+   * Get overlay data for OBS (public)
    */
   fastify.get<{
     Params: { slug: string };
   }>('/:slug', async (request, reply) => {
-    const drop = await prisma.drop.findUnique({
+    const drop = await prisma.drop.findFirst({
       where: { slug: request.params.slug },
       include: {
         polls: {
           where: { isActive: true },
+          orderBy: { createdAt: 'desc' },
           take: 1,
         },
       },
@@ -30,8 +52,8 @@ export const overlayRoutes: FastifyPluginAsync = async (fastify) => {
     let pollWithVotes = null;
     if (drop.polls.length > 0) {
       const poll = drop.polls[0];
-      const options = JSON.parse(poll.options) as string[];
-      
+      const options = safeJsonParse<string[]>(poll.options) ?? [];
+
       const votes = await prisma.action.groupBy({
         by: ['payloadJson'],
         where: {
@@ -43,13 +65,15 @@ export const overlayRoutes: FastifyPluginAsync = async (fastify) => {
 
       const voteCounts = new Array(options.length).fill(0);
       for (const vote of votes) {
-        try {
-          const payload = JSON.parse(vote.payloadJson) as { optionIndex: number; pollId: string };
-          if (payload.pollId === poll.id && payload.optionIndex >= 0 && payload.optionIndex < options.length) {
-            voteCounts[payload.optionIndex] = vote._count;
-          }
-        } catch {
-          // Ignore invalid vote data
+        const payload = safeJsonParse<{ optionIndex: number; pollId: string }>(vote.payloadJson);
+        if (
+          payload &&
+          payload.pollId === poll.id &&
+          typeof payload.optionIndex === 'number' &&
+          payload.optionIndex >= 0 &&
+          payload.optionIndex < options.length
+        ) {
+          voteCounts[payload.optionIndex] += getGroupCount(vote);
         }
       }
 
@@ -74,104 +98,43 @@ export const overlayRoutes: FastifyPluginAsync = async (fastify) => {
       take: 5,
     });
 
-    // Get total action counts
-    const actionCounts = await prisma.action.groupBy({
-      by: ['type'],
-      where: { dropId: drop.id },
-      _count: true,
-    });
-
-    const counts = {
-      tts: 0,
-      votes: 0,
-    };
-    for (const count of actionCounts) {
-      if (count.type === 'TTS') counts.tts = count._count;
-      if (count.type === 'VOTE') counts.votes = count._count;
-    }
-
     return {
       success: true,
       data: {
+        slug: drop.slug,
         name: drop.name,
         symbol: drop.symbol,
         tokenMint: drop.tokenMint,
         status: drop.status,
-        holderThresholdRaw: drop.holderThresholdRaw,
-        imageUrl: drop.imageUrl,
+        // NOTE: verify Bags URL path if needed
         bagsUrl: drop.tokenMint ? `https://bags.fm/${drop.tokenMint}` : null,
         poll: pollWithVotes,
-        ttsQueue: ttsQueue.map(t => {
-          const payload = JSON.parse(t.payloadJson) as { message: string };
+        ttsQueue: ttsQueue.map((t: any) => {
+          const payload = safeJsonParse<{ message?: string }>(t.payloadJson);
           return {
             id: t.id,
-            message: payload.message,
-            viewerWallet: t.viewerWallet.slice(0, 4) + '...' + t.viewerWallet.slice(-4),
+            viewerWallet: t.viewerWallet,
+            message: payload?.message ?? '',
             createdAt: t.createdAt,
           };
         }),
-        counts,
       },
-    };
-  });
-
-  /**
-   * GET /api/overlay/:slug/tts-queue
-   * Get TTS queue only (for polling fallback)
-   */
-  fastify.get<{
-    Params: { slug: string };
-    Querystring: { since?: string };
-  }>('/:slug/tts-queue', async (request, reply) => {
-    const drop = await prisma.drop.findUnique({
-      where: { slug: request.params.slug },
-    });
-
-    if (!drop) {
-      return reply.status(404).send({
-        success: false,
-        error: 'Drop not found',
-      });
-    }
-
-    const since = request.query.since ? new Date(request.query.since) : undefined;
-
-    const ttsQueue = await prisma.action.findMany({
-      where: {
-        dropId: drop.id,
-        type: 'TTS',
-        ...(since ? { createdAt: { gt: since } } : {}),
-      },
-      orderBy: { createdAt: 'desc' },
-      take: 10,
-    });
-
-    return {
-      success: true,
-      data: ttsQueue.map(t => {
-        const payload = JSON.parse(t.payloadJson) as { message: string };
-        return {
-          id: t.id,
-          message: payload.message,
-          viewerWallet: t.viewerWallet.slice(0, 4) + '...' + t.viewerWallet.slice(-4),
-          createdAt: t.createdAt,
-        };
-      }),
     };
   });
 
   /**
    * GET /api/overlay/:slug/poll
-   * Get current poll only (for polling fallback)
+   * Get current poll state (public)
    */
   fastify.get<{
     Params: { slug: string };
   }>('/:slug/poll', async (request, reply) => {
-    const drop = await prisma.drop.findUnique({
+    const drop = await prisma.drop.findFirst({
       where: { slug: request.params.slug },
       include: {
         polls: {
           where: { isActive: true },
+          orderBy: { createdAt: 'desc' },
           take: 1,
         },
       },
@@ -192,8 +155,8 @@ export const overlayRoutes: FastifyPluginAsync = async (fastify) => {
     }
 
     const poll = drop.polls[0];
-    const options = JSON.parse(poll.options) as string[];
-    
+    const options = safeJsonParse<string[]>(poll.options) ?? [];
+
     const votes = await prisma.action.groupBy({
       by: ['payloadJson'],
       where: {
@@ -205,13 +168,15 @@ export const overlayRoutes: FastifyPluginAsync = async (fastify) => {
 
     const voteCounts = new Array(options.length).fill(0);
     for (const vote of votes) {
-      try {
-        const payload = JSON.parse(vote.payloadJson) as { optionIndex: number; pollId: string };
-        if (payload.pollId === poll.id && payload.optionIndex >= 0 && payload.optionIndex < options.length) {
-          voteCounts[payload.optionIndex] = vote._count;
-        }
-      } catch {
-        // Ignore invalid vote data
+      const payload = safeJsonParse<{ optionIndex: number; pollId: string }>(vote.payloadJson);
+      if (
+        payload &&
+        payload.pollId === poll.id &&
+        typeof payload.optionIndex === 'number' &&
+        payload.optionIndex >= 0 &&
+        payload.optionIndex < options.length
+      ) {
+        voteCounts[payload.optionIndex] += getGroupCount(vote);
       }
     }
 

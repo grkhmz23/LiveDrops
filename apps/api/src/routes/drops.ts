@@ -2,7 +2,7 @@ import { FastifyPluginAsync } from 'fastify';
 import { nanoid } from 'nanoid';
 import { prisma } from '../db/client.js';
 import { requireAuth } from '../middleware/auth.js';
-import { createDropSchema, createPollSchema, isValidPublicKey } from '../utils/validation.js';
+import { createDropSchema, createPollSchema } from '../utils/validation.js';
 import * as bags from '../services/bags.js';
 import { broadcastToOverlay } from '../websocket.js';
 
@@ -27,7 +27,7 @@ export const dropsRoutes: FastifyPluginAsync = async (fastify) => {
 
     return {
       success: true,
-      data: drops.map(drop => ({
+      data: drops.map((drop: any) => ({
         id: drop.id,
         slug: drop.slug,
         name: drop.name,
@@ -103,19 +103,19 @@ export const dropsRoutes: FastifyPluginAsync = async (fastify) => {
         ...drop,
         actionCount: drop._count.actions,
         claimCount: drop._count.claims,
-        recentActions: recentActions.map(a => ({
+        recentActions: recentActions.map((a: any) => ({
           id: a.id,
           type: a.type,
           viewerWallet: a.viewerWallet,
           payload: JSON.parse(a.payloadJson),
           createdAt: a.createdAt,
         })),
-        claims: claims.map(c => ({
+        claims: claims.map((c: any) => ({
           id: c.id,
           signatures: JSON.parse(c.signaturesJson),
           createdAt: c.createdAt,
         })),
-        polls: drop.polls.map(p => ({
+        polls: drop.polls.map((p: any) => ({
           id: p.id,
           question: p.question,
           options: JSON.parse(p.options),
@@ -270,30 +270,40 @@ export const dropsRoutes: FastifyPluginAsync = async (fastify) => {
     if (drop.status !== 'TOKEN_INFO_CREATED') {
       return reply.status(400).send({
         success: false,
-        error: `Cannot create fee config: drop status is ${drop.status}, expected TOKEN_INFO_CREATED`,
+        error: `Cannot create fee config: drop is in ${drop.status} status`,
       });
     }
 
     if (!drop.tokenMint) {
       return reply.status(400).send({
         success: false,
-        error: 'Token mint not found. Please create token info first.',
+        error: 'Drop missing tokenMint',
       });
     }
 
     try {
-      // Build fee claimers array
+      const creatorWallet = request.walletPubkey!;
+      
+      // Build fee claimers array matching bags.ts FeeClaimer interface
       const feeClaimers: bags.FeeClaimer[] = [
-        { user: request.walletPubkey!, userBps: drop.streamerBps },
+        { user: creatorWallet, userBps: drop.streamerBps },
         { user: drop.prizePoolWallet, userBps: drop.prizePoolBps },
       ];
 
-      // Call Bags API to create fee config
+      // Create fee config via Bags API (correct signature: payer, baseMint, feeClaimers)
       const result = await bags.createFeeShareConfig(
-        request.walletPubkey!,
-        drop.tokenMint,
-        feeClaimers
+        creatorWallet,        // payer
+        drop.tokenMint,       // baseMint
+        feeClaimers           // feeClaimers array
       );
+
+      // Save configKey (transactions are signed client-side)
+      await prisma.drop.update({
+        where: { id: drop.id },
+        data: {
+          configKey: result.meteoraConfigKey,
+        },
+      });
 
       return {
         success: true,
@@ -314,21 +324,12 @@ export const dropsRoutes: FastifyPluginAsync = async (fastify) => {
 
   /**
    * POST /api/drops/:slug/confirm-fee-config
-   * Confirm that fee config transactions were sent
+   * Step 2b: Confirm fee config transactions were submitted
    */
   fastify.post<{
     Params: { slug: string };
-    Body: { configKey: string; signatures: string[] };
+    Body: { signatures: string[] };
   }>('/:slug/confirm-fee-config', async (request, reply) => {
-    const { configKey, signatures } = request.body;
-
-    if (!configKey || !signatures || !Array.isArray(signatures)) {
-      return reply.status(400).send({
-        success: false,
-        error: 'configKey and signatures are required',
-      });
-    }
-
     const drop = await prisma.drop.findFirst({
       where: {
         slug: request.params.slug,
@@ -346,32 +347,41 @@ export const dropsRoutes: FastifyPluginAsync = async (fastify) => {
     if (drop.status !== 'TOKEN_INFO_CREATED') {
       return reply.status(400).send({
         success: false,
-        error: `Cannot confirm fee config: drop status is ${drop.status}`,
+        error: `Cannot confirm fee config: drop is in ${drop.status} status`,
       });
     }
 
-    // Update drop with config key
+    if (!drop.configKey) {
+      return reply.status(400).send({
+        success: false,
+        error: 'Drop missing configKey',
+      });
+    }
+
+    // Mark status
     await prisma.drop.update({
       where: { id: drop.id },
       data: {
-        configKey,
+        status: 'CONFIG_CREATED',
+      },
+    });
+
+    broadcastToOverlay(drop.slug, {
+      type: 'THRESHOLD_UPDATED',
+      data: {
         status: 'CONFIG_CREATED',
       },
     });
 
     return {
       success: true,
-      data: {
-        status: 'CONFIG_CREATED',
-        configKey,
-      },
+      data: { status: 'CONFIG_CREATED' },
     };
   });
 
   /**
    * POST /api/drops/:slug/create-launch-tx
-   * Step 3: Create the launch transaction
-   * Returns transaction for client to sign
+   * Step 3: Create launch transaction via Bags API
    */
   fastify.post<{
     Params: { slug: string };
@@ -393,34 +403,37 @@ export const dropsRoutes: FastifyPluginAsync = async (fastify) => {
     if (drop.status !== 'CONFIG_CREATED') {
       return reply.status(400).send({
         success: false,
-        error: `Cannot create launch tx: drop status is ${drop.status}, expected CONFIG_CREATED`,
+        error: `Cannot create launch tx: drop is in ${drop.status} status`,
       });
     }
 
     if (!drop.tokenMint || !drop.tokenMetadataUrl || !drop.configKey) {
       return reply.status(400).send({
         success: false,
-        error: 'Missing required data. Please complete previous steps.',
+        error: 'Drop missing tokenMint, tokenMetadataUrl, or configKey',
       });
     }
 
     try {
-      const tx = await bags.createLaunchTransaction({
-        ipfs: drop.tokenMetadataUrl,
+      const creatorWallet = request.walletPubkey!;
+      
+      // Call bags.createLaunchTransaction with correct interface
+      const transaction = await bags.createLaunchTransaction({
+        ipfs: drop.tokenMetadataUrl,                              // IPFS metadata URL
         tokenMint: drop.tokenMint,
-        wallet: request.walletPubkey!,
-        initialBuyLamports: parseInt(drop.initialBuyLamports, 10),
+        wallet: creatorWallet,
+        initialBuyLamports: parseInt(drop.initialBuyLamports, 10) || 0,  // Must be number
         configKey: drop.configKey,
       });
 
       return {
         success: true,
         data: {
-          transaction: tx,
+          transaction,  // base58 serialized tx
         },
       };
     } catch (error) {
-      console.error('Error creating launch transaction:', error);
+      console.error('Error creating launch tx:', error);
       return reply.status(500).send({
         success: false,
         error: error instanceof Error ? error.message : 'Failed to create launch transaction',
@@ -430,21 +443,12 @@ export const dropsRoutes: FastifyPluginAsync = async (fastify) => {
 
   /**
    * POST /api/drops/:slug/confirm-launch
-   * Confirm that launch transaction was sent
+   * Confirm launch was submitted
    */
   fastify.post<{
     Params: { slug: string };
     Body: { signature: string };
   }>('/:slug/confirm-launch', async (request, reply) => {
-    const { signature } = request.body;
-
-    if (!signature) {
-      return reply.status(400).send({
-        success: false,
-        error: 'signature is required',
-      });
-    }
-
     const drop = await prisma.drop.findFirst({
       where: {
         slug: request.params.slug,
@@ -462,59 +466,44 @@ export const dropsRoutes: FastifyPluginAsync = async (fastify) => {
     if (drop.status !== 'CONFIG_CREATED') {
       return reply.status(400).send({
         success: false,
-        error: `Cannot confirm launch: drop status is ${drop.status}`,
+        error: `Cannot confirm launch: drop is in ${drop.status} status`,
       });
     }
 
-    // Update drop with launch signature
-    await prisma.drop.update({
+    const updated = await prisma.drop.update({
       where: { id: drop.id },
       data: {
-        launchSig: signature,
+        launchSig: request.body.signature,
         status: 'LAUNCHED',
       },
     });
 
-    // Broadcast to overlay
     broadcastToOverlay(drop.slug, {
       type: 'DROP_LAUNCHED',
       data: {
-        tokenMint: drop.tokenMint,
-        launchSig: signature,
+        slug: updated.slug,
+        tokenMint: updated.tokenMint,
+        launchSig: updated.launchSig,
       },
     });
 
     return {
       success: true,
       data: {
-        status: 'LAUNCHED',
-        launchSig: signature,
-        tokenMint: drop.tokenMint,
-        viewerUrl: `/d/${drop.slug}`,
-        overlayUrl: `/overlay/${drop.slug}`,
-        bagsUrl: `https://bags.fm/${drop.tokenMint}`,
+        status: updated.status,
+        launchSig: updated.launchSig,
       },
     };
   });
 
   /**
    * POST /api/drops/:slug/polls
-   * Create a new poll for a drop
+   * Create a new poll
    */
   fastify.post<{
     Params: { slug: string };
     Body: unknown;
   }>('/:slug/polls', async (request, reply) => {
-    const parseResult = createPollSchema.safeParse(request.body);
-
-    if (!parseResult.success) {
-      return reply.status(400).send({
-        success: false,
-        error: 'Invalid input',
-        details: parseResult.error.flatten(),
-      });
-    }
-
     const drop = await prisma.drop.findFirst({
       where: {
         slug: request.params.slug,
@@ -529,13 +518,15 @@ export const dropsRoutes: FastifyPluginAsync = async (fastify) => {
       });
     }
 
-    // Deactivate existing polls
-    await prisma.poll.updateMany({
-      where: { dropId: drop.id, isActive: true },
-      data: { isActive: false },
-    });
+    const parseResult = createPollSchema.safeParse(request.body);
+    if (!parseResult.success) {
+      return reply.status(400).send({
+        success: false,
+        error: 'Invalid input',
+        details: parseResult.error.flatten(),
+      });
+    }
 
-    // Create new poll
     const poll = await prisma.poll.create({
       data: {
         dropId: drop.id,
@@ -545,34 +536,30 @@ export const dropsRoutes: FastifyPluginAsync = async (fastify) => {
       },
     });
 
-    // Broadcast to overlay
     broadcastToOverlay(drop.slug, {
       type: 'POLL_CREATED',
       data: {
-        pollId: poll.id,
+        id: poll.id,
         question: poll.question,
-        options: parseResult.data.options,
+        options: JSON.parse(poll.options),
+        isActive: poll.isActive,
+        createdAt: poll.createdAt,
       },
     });
 
     return {
       success: true,
-      data: {
-        id: poll.id,
-        question: poll.question,
-        options: parseResult.data.options,
-        isActive: poll.isActive,
-      },
+      data: poll,
     };
   });
 
   /**
-   * DELETE /api/drops/:slug/polls/:pollId
-   * Close a poll
+   * POST /api/drops/:slug/polls/:pollId/close
+   * Close an active poll
    */
-  fastify.delete<{
+  fastify.post<{
     Params: { slug: string; pollId: string };
-  }>('/:slug/polls/:pollId', async (request, reply) => {
+  }>('/:slug/polls/:pollId/close', async (request, reply) => {
     const drop = await prisma.drop.findFirst({
       where: {
         slug: request.params.slug,
@@ -591,35 +578,39 @@ export const dropsRoutes: FastifyPluginAsync = async (fastify) => {
       where: {
         id: request.params.pollId,
         dropId: drop.id,
+        isActive: true,
       },
     });
 
     if (!poll) {
       return reply.status(404).send({
         success: false,
-        error: 'Poll not found',
+        error: 'Poll not found or already closed',
       });
     }
 
-    await prisma.poll.update({
+    const updated = await prisma.poll.update({
       where: { id: poll.id },
       data: { isActive: false },
     });
 
-    // Broadcast to overlay
     broadcastToOverlay(drop.slug, {
       type: 'POLL_CLOSED',
-      data: { pollId: poll.id },
+      data: {
+        id: updated.id,
+        isActive: updated.isActive,
+      },
     });
 
     return {
       success: true,
+      data: updated,
     };
   });
 
   /**
    * GET /api/drops/:slug/claimable
-   * Get claimable positions for this drop
+   * Get claimable positions for fees
    */
   fastify.get<{
     Params: { slug: string };
@@ -638,63 +629,52 @@ export const dropsRoutes: FastifyPluginAsync = async (fastify) => {
       });
     }
 
-    if (drop.status !== 'LAUNCHED' || !drop.tokenMint) {
+    if (!drop.tokenMint) {
       return reply.status(400).send({
         success: false,
-        error: 'Drop is not launched',
+        error: 'Drop missing tokenMint',
       });
     }
 
     try {
-      const allPositions = await bags.getClaimablePositions(request.walletPubkey!);
-      const positions = allPositions.filter((p) => p.baseMint === drop.tokenMint);
+      const wallet = request.walletPubkey!;
+      const positions = await bags.getClaimablePositions(wallet);
+
+      // Filter by baseMint (not tokenMint - that's the field name in ClaimablePosition)
+      const tokenPositions = positions.filter((p) => p.baseMint === drop.tokenMint);
 
       // Calculate total claimable
-      let totalClaimable = BigInt(0);
-      for (const pos of positions) {
+      let totalClaimableLamports = BigInt(0);
+      for (const pos of tokenPositions) {
         if (pos.totalClaimableLamportsUserShare) {
-          totalClaimable += BigInt(pos.totalClaimableLamportsUserShare);
-        } else if (pos.virtualPoolClaimableLamportsUserShare) {
-          totalClaimable += BigInt(pos.virtualPoolClaimableLamportsUserShare);
-        }
-        if (pos.dammPoolClaimableLamportsUserShare) {
-          totalClaimable += BigInt(pos.dammPoolClaimableLamportsUserShare);
+          totalClaimableLamports += BigInt(pos.totalClaimableLamportsUserShare);
         }
       }
 
       return {
         success: true,
         data: {
-          positions,
-          totalClaimableLamports: totalClaimable.toString(),
+          positions: tokenPositions,
+          totalClaimableLamports: totalClaimableLamports.toString(),
         },
       };
     } catch (error) {
-      console.error('Error fetching claimable positions:', error);
+      console.error('Error getting claimable positions:', error);
       return reply.status(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Failed to fetch claimable positions',
+        error: error instanceof Error ? error.message : 'Failed to get claimable positions',
       });
     }
   });
 
   /**
    * POST /api/drops/:slug/claim
-   * Generate claim transactions for a position
+   * Create claim transactions for a specific position
    */
   fastify.post<{
     Params: { slug: string };
     Body: { position: bags.ClaimablePosition };
   }>('/:slug/claim', async (request, reply) => {
-    const { position } = request.body;
-
-    if (!position) {
-      return reply.status(400).send({
-        success: false,
-        error: 'position is required',
-      });
-    }
-
     const drop = await prisma.drop.findFirst({
       where: {
         slug: request.params.slug,
@@ -709,17 +689,32 @@ export const dropsRoutes: FastifyPluginAsync = async (fastify) => {
       });
     }
 
-    if (drop.status !== 'LAUNCHED') {
+    if (!drop.tokenMint) {
       return reply.status(400).send({
         success: false,
-        error: 'Drop is not launched',
+        error: 'Drop missing tokenMint',
+      });
+    }
+
+    const { position } = request.body;
+    if (!position) {
+      return reply.status(400).send({
+        success: false,
+        error: 'position is required',
       });
     }
 
     try {
-      const claimReq = bags.buildClaimTxRequestFromPosition(request.walletPubkey!, position);
-      const txs = await bags.getClaimTransactions(claimReq);
-      const transactions = txs.map((t) => t.tx);
+      const wallet = request.walletPubkey!;
+
+      // Build claim request from position using helper
+      const claimRequest = bags.buildClaimTxRequestFromPosition(wallet, position);
+      
+      // Get claim transactions
+      const txResponses = await bags.getClaimTransactions(claimRequest);
+      
+      // Extract just the transaction strings
+      const transactions = txResponses.map((t) => t.tx);
 
       return {
         success: true,
@@ -728,31 +723,22 @@ export const dropsRoutes: FastifyPluginAsync = async (fastify) => {
         },
       };
     } catch (error) {
-      console.error('Error generating claim transactions:', error);
+      console.error('Error creating claim transactions:', error);
       return reply.status(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Failed to generate claim transactions',
+        error: error instanceof Error ? error.message : 'Failed to create claim transactions',
       });
     }
   });
 
   /**
    * POST /api/drops/:slug/confirm-claim
-   * Record a successful claim
+   * Record successful claim
    */
   fastify.post<{
     Params: { slug: string };
     Body: { signatures: string[] };
   }>('/:slug/confirm-claim', async (request, reply) => {
-    const { signatures } = request.body;
-
-    if (!signatures || !Array.isArray(signatures) || signatures.length === 0) {
-      return reply.status(400).send({
-        success: false,
-        error: 'signatures array is required',
-      });
-    }
-
     const drop = await prisma.drop.findFirst({
       where: {
         slug: request.params.slug,
@@ -767,68 +753,16 @@ export const dropsRoutes: FastifyPluginAsync = async (fastify) => {
       });
     }
 
-    // Record the claim
     const claim = await prisma.claim.create({
       data: {
         dropId: drop.id,
-        signaturesJson: JSON.stringify(signatures),
+        signaturesJson: JSON.stringify(request.body.signatures),
       },
     });
 
     return {
       success: true,
-      data: {
-        claimId: claim.id,
-        signatures,
-      },
-    };
-  });
-
-  /**
-   * PUT /api/drops/:slug/threshold
-   * Update holder threshold
-   */
-  fastify.put<{
-    Params: { slug: string };
-    Body: { holderThresholdRaw: string };
-  }>('/:slug/threshold', async (request, reply) => {
-    const { holderThresholdRaw } = request.body;
-
-    if (!holderThresholdRaw || !/^\d+$/.test(holderThresholdRaw)) {
-      return reply.status(400).send({
-        success: false,
-        error: 'holderThresholdRaw must be a non-negative integer string',
-      });
-    }
-
-    const drop = await prisma.drop.findFirst({
-      where: {
-        slug: request.params.slug,
-        ownerUserId: request.userId,
-      },
-    });
-
-    if (!drop) {
-      return reply.status(404).send({
-        success: false,
-        error: 'Drop not found',
-      });
-    }
-
-    await prisma.drop.update({
-      where: { id: drop.id },
-      data: { holderThresholdRaw },
-    });
-
-    // Broadcast to overlay
-    broadcastToOverlay(drop.slug, {
-      type: 'THRESHOLD_UPDATED',
-      data: { holderThresholdRaw },
-    });
-
-    return {
-      success: true,
-      data: { holderThresholdRaw },
+      data: claim,
     };
   });
 };

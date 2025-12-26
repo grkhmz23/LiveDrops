@@ -1,7 +1,6 @@
 import { FastifyPluginAsync } from 'fastify';
 import { prisma } from '../db/client.js';
 import { getConnection } from '../services/solana.js';
-import { getRateLimitInfo } from '../services/bags.js';
 
 export const healthRoutes: FastifyPluginAsync = async (fastify) => {
   /**
@@ -17,9 +16,12 @@ export const healthRoutes: FastifyPluginAsync = async (fastify) => {
 
   /**
    * GET /health/detailed
-   * Detailed health check (authenticated)
+   * Detailed health check
+   *
+   * Note: This endpoint intentionally does not call external third-party APIs
+   * (e.g., Bags) because health checks should remain reliable and cheap.
    */
-  fastify.get('/detailed', async (request, reply) => {
+  fastify.get('/detailed', async (_request, _reply) => {
     const checks: Record<string, { status: string; latencyMs?: number; error?: string }> = {};
 
     // Check database
@@ -53,15 +55,7 @@ export const healthRoutes: FastifyPluginAsync = async (fastify) => {
       };
     }
 
-    // Check Bags API rate limit
-    const rateLimitInfo = getRateLimitInfo();
-    if (rateLimitInfo) {
-      checks.bagsApi = {
-        status: rateLimitInfo.remaining > 0 ? 'ok' : 'rate_limited',
-      };
-    }
-
-    const allOk = Object.values(checks).every(c => c.status === 'ok');
+    const allOk = Object.values(checks).every((c) => c.status === 'ok');
 
     return {
       status: allOk ? 'healthy' : 'degraded',
