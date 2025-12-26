@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import Fastify from 'fastify';
 import fastifyCors from '@fastify/cors';
 import fastifyCookie from '@fastify/cookie';
@@ -21,15 +22,6 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const fastify = Fastify({
     logger: {
         level: config.isProduction ? 'info' : 'debug',
-        transport: config.isProduction
-            ? undefined
-            : {
-                target: 'pino-pretty',
-                options: {
-                    translateTime: 'HH:MM:ss Z',
-                    ignore: 'pid,hostname',
-                },
-            },
     },
     trustProxy: true,
 });
@@ -68,7 +60,6 @@ if (existsSync(publicPath)) {
     });
     // SPA fallback - serve index.html for all non-API routes
     fastify.setNotFoundHandler(async (_request, reply) => {
-        // Use reply.request in case the request param is unused/omitted by TS rules
         const url = reply.request.url;
         if (url.startsWith('/api/') || url.startsWith('/ws/') || url.startsWith('/health')) {
             return reply.status(404).send({ success: false, error: 'Not found' });
@@ -114,8 +105,8 @@ const shutdown = async (signal) => {
         await disconnectDatabase();
         process.exit(0);
     }
-    catch (error) {
-        fastify.log.error(error, 'Error during shutdown');
+    catch (err) {
+        fastify.log.error(err, 'Error during shutdown');
         process.exit(1);
     }
 };
@@ -124,37 +115,30 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 // Start server
 const start = async () => {
     try {
-        // Connect to database
         await connectDatabase();
         // Start session cleanup interval (every hour)
         setInterval(async () => {
             try {
                 const cleaned = await cleanupExpiredSessions();
-                if (cleaned > 0) {
+                if (cleaned > 0)
                     fastify.log.info(`Cleaned up ${cleaned} expired sessions`);
-                }
             }
-            catch (error) {
-                fastify.log.error(error, 'Session cleanup error');
+            catch (err) {
+                fastify.log.error(err, 'Session cleanup error');
             }
         }, 60 * 60 * 1000);
-        // Start listening
         await fastify.listen({
             port: config.port,
             host: '0.0.0.0',
         });
-        console.log(`
-╔═══════════════════════════════════════════════════════════╗
-║                      LiveDrops Server                      ║
-╠═══════════════════════════════════════════════════════════╣
-║  Server running on http://localhost:${config.port.toString().padEnd(4)}               ║
-║  Environment: ${config.nodeEnv.padEnd(11)}                            ║
-║  App Origin: ${config.appOrigin.substring(0, 30).padEnd(30)}       ║
-╚═══════════════════════════════════════════════════════════╝
-    `);
+        fastify.log.info({
+            port: config.port,
+            env: config.nodeEnv,
+            appOrigin: config.appOrigin,
+        }, 'LiveDrops server started');
     }
-    catch (error) {
-        fastify.log.error(error);
+    catch (err) {
+        fastify.log.error(err);
         process.exit(1);
     }
 };
