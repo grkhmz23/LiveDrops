@@ -278,7 +278,7 @@ Viewer gating blocks actions below threshold and allows above threshold.
 Overlay receives actions in real time.
 
 Claim flow generates claim tx(s) and records claim signatures.
-
+Production: https://livedrops.fun
 License
 
 MIT
