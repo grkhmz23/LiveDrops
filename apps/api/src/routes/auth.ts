@@ -16,13 +16,10 @@ import { getSessionCookieOptions, requireAuth } from '../middleware/auth.js';
 
 export const authRoutes: FastifyPluginAsync = async (fastify) => {
   // Rate limit login endpoints
-  fastify.register(import('@fastify/rate-limit'), {
+  await fastify.register(import('@fastify/rate-limit'), {
     max: config.rateLimit.login.max,
     timeWindow: config.rateLimit.login.windowMs,
-    keyGenerator: (request) => {
-      // Rate limit by IP for auth endpoints
-      return request.ip;
-    },
+    keyGenerator: (request) => request.ip,
   });
 
   /**
@@ -33,7 +30,7 @@ export const authRoutes: FastifyPluginAsync = async (fastify) => {
     Querystring: { walletPubkey: string };
   }>('/nonce', async (request, reply) => {
     const parseResult = authNonceSchema.safeParse(request.query);
-    
+
     if (!parseResult.success) {
       return reply.status(400).send({
         success: false,
@@ -45,16 +42,16 @@ export const authRoutes: FastifyPluginAsync = async (fastify) => {
     const { walletPubkey } = parseResult.data;
     const timestamp = Date.now();
     const message = generateNonceMessage(walletPubkey, timestamp);
-    
-    // Store nonce for verification
+
+    // Store nonce for verification (single-use, TTL enforced in session service)
     storeNonce(walletPubkey, message);
+
+    // Prevent caching of nonce responses
+    reply.header('Cache-Control', 'no-store');
 
     return {
       success: true,
-      data: {
-        message,
-        timestamp,
-      },
+      data: { message, timestamp },
     };
   });
 
@@ -70,7 +67,7 @@ export const authRoutes: FastifyPluginAsync = async (fastify) => {
     };
   }>('/verify', async (request, reply) => {
     const parseResult = authVerifySchema.safeParse(request.body);
-    
+
     if (!parseResult.success) {
       return reply.status(400).send({
         success: false,
@@ -81,7 +78,7 @@ export const authRoutes: FastifyPluginAsync = async (fastify) => {
 
     const { walletPubkey, signature, message } = parseResult.data;
 
-    // Verify the nonce message matches what we stored
+    // Verify the nonce message matches what we stored (single-use)
     const storedMessage = consumeNonce(walletPubkey);
     if (!storedMessage || storedMessage !== message) {
       return reply.status(400).send({
@@ -93,7 +90,25 @@ export const authRoutes: FastifyPluginAsync = async (fastify) => {
     // Verify the signature
     try {
       const publicKey = new PublicKey(walletPubkey);
-      const signatureBytes = bs58.decode(signature);
+
+      let signatureBytes: Uint8Array;
+      try {
+        signatureBytes = bs58.decode(signature);
+      } catch {
+        return reply.status(401).send({
+          success: false,
+          error: 'Invalid signature encoding',
+        });
+      }
+
+      // Ed25519 signatures must be 64 bytes
+      if (signatureBytes.length !== 64) {
+        return reply.status(401).send({
+          success: false,
+          error: 'Invalid signature length',
+        });
+      }
+
       const messageBytes = new TextEncoder().encode(message);
 
       const isValid = nacl.sign.detached.verify(
@@ -109,7 +124,7 @@ export const authRoutes: FastifyPluginAsync = async (fastify) => {
         });
       }
     } catch (error) {
-      console.error('Signature verification error:', error);
+      fastify.log.error({ err: error }, 'Signature verification error');
       return reply.status(401).send({
         success: false,
         error: 'Signature verification failed',
@@ -117,25 +132,22 @@ export const authRoutes: FastifyPluginAsync = async (fastify) => {
     }
 
     // Find or create user
-    let user = await prisma.user.findUnique({
-      where: { walletPubkey },
-    });
-
+    let user = await prisma.user.findUnique({ where: { walletPubkey } });
     if (!user) {
-      user = await prisma.user.create({
-        data: { walletPubkey },
-      });
+      user = await prisma.user.create({ data: { walletPubkey } });
     }
 
-    // Create session
+    // Create session token (raw token, hashed in DB)
     const sessionToken = await createSession(user.id);
 
-    // Set session cookie
-    reply.setCookie(
-      config.session.cookieName,
-      sessionToken,
-      getSessionCookieOptions(config.isProduction)
-    );
+    // Cookie options: ensure maxAge is always aligned with config
+    const cookieOpts = {
+      ...getSessionCookieOptions(config.isProduction),
+      maxAge: config.session.expiryHours * 60 * 60,
+      path: '/', // ensure consistent clearing
+    };
+
+    reply.setCookie(config.session.cookieName, sessionToken, cookieOpts);
 
     return {
       success: true,
@@ -157,40 +169,41 @@ export const authRoutes: FastifyPluginAsync = async (fastify) => {
       await deleteSession(sessionToken);
     }
 
-    reply.clearCookie(config.session.cookieName, {
+    // Clear with the same attributes used to set the cookie
+    const clearOpts = {
+      ...getSessionCookieOptions(config.isProduction),
       path: '/',
-    });
-
-    return {
-      success: true,
     };
+
+    reply.clearCookie(config.session.cookieName, clearOpts);
+
+    return { success: true };
   });
 
   /**
    * GET /api/auth/me
    * Get current user info
    */
-  fastify.get('/me', {
-    preHandler: requireAuth,
-  }, async (request) => {
-    const user = await prisma.user.findUnique({
-      where: { id: request.userId },
-    });
+  fastify.get(
+    '/me',
+    { preHandler: requireAuth },
+    async (request) => {
+      const user = await prisma.user.findUnique({
+        where: { id: request.userId },
+      });
 
-    if (!user) {
+      if (!user) {
+        return { success: false, error: 'User not found' };
+      }
+
       return {
-        success: false,
-        error: 'User not found',
+        success: true,
+        data: {
+          userId: user.id,
+          walletPubkey: user.walletPubkey,
+          createdAt: user.createdAt,
+        },
       };
     }
-
-    return {
-      success: true,
-      data: {
-        userId: user.id,
-        walletPubkey: user.walletPubkey,
-        createdAt: user.createdAt,
-      },
-    };
-  });
+  );
 };
