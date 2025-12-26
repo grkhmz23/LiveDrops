@@ -3,6 +3,14 @@ import { prisma } from '../db/client.js';
 import { config } from '../config.js';
 
 /**
+ * Tunables
+ * - NONCE_TTL_MS: how long a nonce is valid for signature verification
+ * - LAST_SEEN_UPDATE_MS: throttle DB writes for lastSeenAt to reduce SQLite write load
+ */
+const NONCE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const LAST_SEEN_UPDATE_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
  * Generate a cryptographically secure random token
  */
 export function generateSessionToken(): string {
@@ -29,6 +37,7 @@ export async function createSession(userId: string): Promise<string> {
       userId,
       cookieTokenHash: tokenHash,
       expiresAt,
+      // lastSeenAt default is handled by Prisma schema default(now())
     },
   });
 
@@ -38,7 +47,9 @@ export async function createSession(userId: string): Promise<string> {
 /**
  * Validate a session token and return the associated user
  */
-export async function validateSession(token: string): Promise<{ userId: string; walletPubkey: string } | null> {
+export async function validateSession(
+  token: string
+): Promise<{ userId: string; walletPubkey: string } | null> {
   const tokenHash = hashSessionToken(token);
 
   const session = await prisma.session.findUnique({
@@ -46,22 +57,26 @@ export async function validateSession(token: string): Promise<{ userId: string; 
     include: { user: true },
   });
 
-  if (!session) {
-    return null;
-  }
+  if (!session) return null;
 
-  // Check if session has expired
-  if (session.expiresAt < new Date()) {
-    // Clean up expired session
+  const now = Date.now();
+
+  // Expired: delete and reject
+  if (session.expiresAt.getTime() < now) {
     await prisma.session.delete({ where: { id: session.id } }).catch(() => {});
     return null;
   }
 
-  // Update last seen timestamp
-  await prisma.session.update({
-    where: { id: session.id },
-    data: { lastSeenAt: new Date() },
-  }).catch(() => {}); // Non-critical, don't fail if update fails
+  // Throttle lastSeenAt updates to reduce DB writes under load
+  const lastSeen = session.lastSeenAt?.getTime?.() ?? 0;
+  if (lastSeen < now - LAST_SEEN_UPDATE_MS) {
+    await prisma.session
+      .update({
+        where: { id: session.id },
+        data: { lastSeenAt: new Date(now) },
+      })
+      .catch(() => {});
+  }
 
   return {
     userId: session.userId,
@@ -93,53 +108,64 @@ export async function deleteAllUserSessions(userId: string): Promise<void> {
  */
 export async function cleanupExpiredSessions(): Promise<number> {
   const result = await prisma.session.deleteMany({
-    where: {
-      expiresAt: { lt: new Date() },
-    },
+    where: { expiresAt: { lt: new Date() } },
   });
   return result.count;
 }
 
 /**
  * Generate a nonce message for wallet signature
+ *
+ * Note: This is intentionally plain-text and deterministic in structure.
+ * The nonce itself is random bytes embedded in the message.
  */
 export function generateNonceMessage(walletPubkey: string, timestamp: number): string {
-  return `Sign this message to authenticate with LiveDrops.\n\nWallet: ${walletPubkey}\nTimestamp: ${timestamp}\nNonce: ${randomBytes(16).toString('hex')}`;
+  return [
+    'Sign this message to authenticate with LiveDrops.',
+    '',
+    `Wallet: ${walletPubkey}`,
+    `Timestamp: ${timestamp}`,
+    `Nonce: ${randomBytes(16).toString('hex')}`,
+  ].join('\n');
 }
 
-// Store nonces temporarily (in production, consider Redis)
-const nonceStore = new Map<string, { message: string; timestamp: number }>();
+/**
+ * Nonce storage (in-memory)
+ *
+ * This is acceptable for hackathon/demo, but NOT restart-safe:
+ * if the server restarts between nonce issuance and verification, verification will fail.
+ * Next step (after you paste auth.ts): move this to DB with a Nonce table.
+ */
+const nonceStore = new Map<string, { message: string; issuedAtMs: number }>();
 
 /**
  * Store a nonce for later verification
  */
 export function storeNonce(walletPubkey: string, message: string): void {
-  // Clean old nonces (older than 5 minutes)
-  const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
+  // Opportunistic cleanup to prevent unbounded growth
+  const cutoff = Date.now() - NONCE_TTL_MS;
   for (const [key, value] of nonceStore.entries()) {
-    if (value.timestamp < fiveMinutesAgo) {
-      nonceStore.delete(key);
-    }
+    if (value.issuedAtMs < cutoff) nonceStore.delete(key);
   }
 
-  nonceStore.set(walletPubkey, { message, timestamp: Date.now() });
+  // One active nonce per wallet (newest overwrites old)
+  nonceStore.set(walletPubkey, { message, issuedAtMs: Date.now() });
 }
 
 /**
- * Get and consume a stored nonce
+ * Get and consume a stored nonce (single-use)
  */
 export function consumeNonce(walletPubkey: string): string | null {
   const stored = nonceStore.get(walletPubkey);
-  if (!stored) {
-    return null;
-  }
+  if (!stored) return null;
 
-  // Check if nonce is expired (5 minute validity)
-  if (Date.now() - stored.timestamp > 5 * 60 * 1000) {
+  // TTL check
+  if (Date.now() - stored.issuedAtMs > NONCE_TTL_MS) {
     nonceStore.delete(walletPubkey);
     return null;
   }
 
+  // Single-use
   nonceStore.delete(walletPubkey);
   return stored.message;
 }
