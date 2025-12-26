@@ -1,0 +1,39 @@
+{
+  "name": "@livedrops/api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc && cp -r ../web/dist ./dist/public 2>/dev/null || mkdir -p ./dist/public",
+    "start": "node dist/index.js",
+    "db:generate": "prisma generate",
+    "db:push": "prisma db push",
+    "db:seed": "tsx prisma/seed.ts",
+    "db:studio": "prisma studio"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^9.3.1",
+    "@fastify/cors": "^9.0.1",
+    "@fastify/multipart": "^8.1.0",
+    "@fastify/rate-limit": "^9.1.0",
+    "@fastify/static": "^7.0.1",
+    "@fastify/websocket": "^10.0.1",
+    "@prisma/client": "^5.10.2",
+    "@solana/web3.js": "^1.91.1",
+    "bs58": "^5.0.0",
+    "dotenv": "^16.4.5",
+    "fastify": "^4.26.2",
+    "nanoid": "^5.0.6",
+    "tweetnacl": "^1.0.3",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.24",
+    "@types/ws": "^8.5.10",
+    "prisma": "^5.10.2",
+    "tsx": "^4.7.1",
+    "typescript": "^5.3.3"
+  }
+}

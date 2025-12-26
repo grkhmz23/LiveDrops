@@ -1,0 +1,98 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String    @id @default(cuid())
+  walletPubkey String    @unique
+  createdAt    DateTime  @default(now())
+  sessions     Session[]
+  drops        Drop[]
+}
+
+model Session {
+  id              String   @id @default(cuid())
+  userId          String
+  cookieTokenHash String   @unique
+  createdAt       DateTime @default(now())
+  expiresAt       DateTime
+  lastSeenAt      DateTime @default(now())
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model Drop {
+  id                 String    @id @default(cuid())
+  slug               String    @unique
+  ownerUserId        String
+  name               String
+  symbol             String
+  description        String
+  imageUrl           String?
+  tokenMint          String?
+  tokenMetadataUrl   String?
+  configKey          String?
+  launchSig          String?
+  status             String    @default("DRAFT") // DRAFT, TOKEN_INFO_CREATED, CONFIG_CREATED, LAUNCHED
+  prizePoolWallet    String
+  streamerBps        Int       @default(5000) // 50% default
+  prizePoolBps       Int       @default(5000) // 50% default
+  holderThresholdRaw String    @default("0") // BigInt as string (base units)
+  initialBuyLamports String    @default("10000000") // 0.01 SOL default
+  twitterUrl         String?
+  websiteUrl         String?
+  telegramUrl        String?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  owner              User      @relation(fields: [ownerUserId], references: [id], onDelete: Cascade)
+  actions            Action[]
+  claims             Claim[]
+  polls              Poll[]
+
+  @@index([ownerUserId])
+  @@index([status])
+}
+
+model Action {
+  id           String   @id @default(cuid())
+  dropId       String
+  viewerWallet String
+  type         String   // TTS, VOTE
+  payloadJson  String   // JSON stringified payload
+  createdAt    DateTime @default(now())
+  drop         Drop     @relation(fields: [dropId], references: [id], onDelete: Cascade)
+
+  @@index([dropId])
+  @@index([viewerWallet])
+  @@index([createdAt])
+}
+
+model Claim {
+  id             String   @id @default(cuid())
+  dropId         String
+  signaturesJson String   // JSON array of tx signatures
+  createdAt      DateTime @default(now())
+  drop           Drop     @relation(fields: [dropId], references: [id], onDelete: Cascade)
+
+  @@index([dropId])
+}
+
+model Poll {
+  id        String   @id @default(cuid())
+  dropId    String
+  question  String
+  options   String   // JSON array of options
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  drop      Drop     @relation(fields: [dropId], references: [id], onDelete: Cascade)
+
+  @@index([dropId])
+  @@index([isActive])
+}
