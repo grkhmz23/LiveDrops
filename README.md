@@ -1,314 +1,284 @@
-# LiveDrops - Streamer Token Launcher
+LiveDrops
 
-Launch access tokens on Solana during live streams with Bags API integration. Gate viewer interactions (TTS, voting) by token holdings.
+LiveDrops is a web app for streamers and podcasters to launch Solana “access tokens” on Bags and run token-gated interactions during a live session. It includes a creator dashboard, a viewer interaction page, and an OBS-ready overlay that updates in real time.
 
-## Features
+Typical use cases:
 
-- **Wallet Authentication**: Secure signature-based login with session management
-- **Token Launch v2**: Full Bags API integration for creating and launching tokens
-- **Fee Sharing**: Configure 50/50 split between streamer and prize pool (customizable)
-- **OBS Overlay**: Real-time browser source overlay (1920x1080) with WebSocket updates
-- **Token Gating**: Require viewers to hold tokens for TTS messages and voting
-- **Fee Claiming**: Claim accumulated trading fees from the dashboard
+Launch a token during a stream and direct viewers to buy on Bags.
 
-## Architecture
+Gate viewer actions (messages and votes) by token holdings.
 
-```
+Split protocol fees between the creator and a prize pool wallet.
+
+Claim earned fees from the creator dashboard.
+
+Key features
+
+Wallet-based authentication: signature login with server-side sessions (no passwords).
+
+Bags Token Launch v2 flow: create token metadata, configure fee sharing, launch via signed transactions.
+
+Fee sharing: configure basis-point splits between the creator wallet and a prize pool wallet (defaults to 50/50).
+
+Token gating: enforce minimum token holdings for viewer interactions.
+
+OBS overlay: a 1920×1080 browser-source overlay with live updates via WebSockets.
+
+Fee claiming: generate and submit fee-claim transactions from the dashboard.
+
+How it works
+Creator flow
+
+Connect a wallet and sign a nonce to log in.
+
+Create a Drop (token name, symbol, description, image, prize pool wallet, fee split, holding threshold).
+
+Run the launch pipeline:
+
+Create Token Info: creates token metadata and returns the token mint + metadata URL.
+
+Create Fee Config: generates fee-sharing configuration transactions to sign and submit.
+
+Launch: generates the launch transaction to sign and submit.
+
+Share two links:
+
+Viewer page: where viewers connect wallets and participate.
+
+Overlay: used in OBS Browser Source to display live events.
+
+Claim fees later from the dashboard (generates claim transactions for signing).
+
+Viewer flow
+
+Open the viewer page for a Drop.
+
+Connect a wallet.
+
+If holdings meet the threshold, submit:
+
+a TTS message request (queued and broadcast to overlay),
+
+and/or a vote (if a poll is active).
+
+Project structure
 livedrops/
 ├── apps/
-│   ├── api/          # Fastify backend (Node.js + TypeScript)
+│   ├── api/                 # Fastify backend (Node.js + TypeScript)
 │   │   ├── src/
-│   │   │   ├── routes/      # API endpoints
-│   │   │   ├── services/    # Business logic (Bags API, Solana, sessions)
-│   │   │   ├── middleware/  # Auth middleware
-│   │   │   └── utils/       # Validation, sanitization
-│   │   └── prisma/          # Database schema
-│   └── web/          # React frontend (Vite + TypeScript)
+│   │   │   ├── routes/       # HTTP API routes
+│   │   │   ├── services/     # Bags API, Solana, auth/session logic
+│   │   │   ├── middleware/   # Auth middleware
+│   │   │   └── utils/        # Validation, sanitization, helpers
+│   │   └── prisma/           # Prisma schema + migrations
+│   └── web/                 # React frontend (Vite + TypeScript)
 │       └── src/
-│           ├── pages/       # Route components
-│           ├── components/  # UI components
-│           ├── hooks/       # React hooks (auth, websocket)
-│           └── lib/         # Utilities (API, Solana)
-├── .env.example      # Environment template
+│           ├── pages/        # Route pages
+│           ├── components/   # UI components
+│           ├── hooks/        # Auth + websocket hooks
+│           └── lib/          # API + Solana utilities
+├── .env.example
 └── README.md
-```
 
-## Quick Start
+Prerequisites
 
-### Prerequisites
+Node.js 20+
 
-- Node.js 20+
-- npm or yarn
-- A Solana wallet (Phantom, Solflare, etc.)
-- Bags API key from [dev.bags.fm](https://dev.bags.fm)
+npm
 
-### Local Development
+A Solana wallet extension (Phantom, Solflare, etc.)
 
-1. **Clone and install dependencies**
-```bash
-git clone <repo-url>
-cd livedrops
+A Bags API key
+
+Local development
+1) Install dependencies
 npm install
-```
 
-2. **Configure environment**
-```bash
+2) Configure environment
 cp .env.example .env
-```
 
-Edit `.env` with your values:
-```env
+
+Update .env with your values:
+
 BAGS_API_KEY=your_bags_api_key_here
 SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
-APP_ORIGIN=http://localhost:3000
+APP_ORIGIN=http://localhost:5173
 PORT=3000
 DATABASE_URL=file:./dev.db
 NODE_ENV=development
-```
+SESSION_COOKIE_NAME=livedrops_session
 
-3. **Initialize database**
-```bash
+
+Notes:
+
+APP_ORIGIN must match the frontend origin for cookies and CORS.
+
+Use a reliable RPC for mainnet if you expect traffic.
+
+3) Initialize database
 npm run db:generate
 npm run db:push
-```
 
-4. **Start development servers**
-```bash
+4) Run the app
 npm run dev
-```
 
-This starts:
-- API server: http://localhost:3000
-- Web dev server: http://localhost:5173 (proxies to API)
 
-5. **Open the app**
+By default:
 
-Navigate to http://localhost:5173 and connect your wallet.
+Web app: http://localhost:5173
 
-### Production Build
+API server: http://localhost:3000
 
-```bash
-# Build web and API
+Production build
 npm run build
-
-# Start production server
 npm run start
-```
 
-The production server serves the built React app from the API server on port 3000.
 
-## Replit Deployment
+The production server serves the built frontend from the API process.
 
-### Step 1: Import from GitHub
+OBS overlay setup
 
-1. Create a new Replit
-2. Choose "Import from GitHub"
-3. Paste your repository URL
+In OBS, add a Browser Source.
 
-### Step 2: Configure Secrets
+Set the URL to:
 
-In the Replit Secrets tab, add:
+https://your-domain.com/overlay/<drop-slug>
 
-| Key | Value | Required |
-|-----|-------|----------|
-| `BAGS_API_KEY` | Your Bags API key | ✅ |
-| `SOLANA_RPC_URL` | `https://api.mainnet-beta.solana.com` | ✅ |
-| `APP_ORIGIN` | Your Replit URL (e.g., `https://livedrops.username.repl.co`) | ✅ |
-| `DATABASE_URL` | `file:./prod.db` | ✅ |
-| `NODE_ENV` | `production` | ✅ |
-| `SESSION_COOKIE_NAME` | `livedrops_session` | Optional |
+Set the resolution to 1920×1080.
 
-### Step 3: Configure Replit
+Optional: enable “Refresh browser when scene becomes active”.
 
-Create or update `.replit`:
-```toml
-run = "npm run start"
-entrypoint = "apps/api/src/index.ts"
+API overview
+Authentication
 
-[nix]
-channel = "stable-23_11"
+GET /api/auth/nonce?walletPubkey=...
 
-[deployment]
-run = ["sh", "-c", "npm run build && npm run start"]
-build = ["sh", "-c", "npm install && npm run db:generate && npm run db:push"]
-```
+POST /api/auth/verify
 
-### Step 4: Deploy
+POST /api/auth/logout
 
-Click "Run" or use the Deploy button.
+GET /api/auth/me
 
-## User Flows
+Drops (authenticated)
 
-### Creator Flow
+GET /api/drops
 
-1. **Connect Wallet**: Click "Connect Wallet" and sign the authentication message
-2. **Create Drop**: Fill in token details (name, symbol, description, image URL)
-3. **Launch Token**:
-   - **Step 1**: Create Token Info → Generates tokenMint and metadata
-   - **Step 2**: Create Fee Config → Sign transaction(s) to set up fee sharing
-   - **Step 3**: Launch → Sign final transaction to launch on Bags
-4. **Share URLs**: Copy the Viewer Page and OBS Overlay URLs
-5. **Claim Fees**: Claim accumulated trading fees from the dashboard
+GET /api/drops/:slug
 
-### Viewer Flow
+POST /api/drops
 
-1. **Visit Viewer Page**: `/d/{slug}`
-2. **Connect Wallet**: Required to interact
-3. **Buy Tokens**: Link to Bags for purchasing
-4. **Interact**: 
-   - Submit TTS messages (if holding threshold)
-   - Vote in polls (if holding threshold)
+POST /api/drops/:slug/create-token-info
 
-### OBS Setup
+POST /api/drops/:slug/create-fee-config
 
-1. Add a **Browser Source** in OBS
-2. Set URL to: `https://your-app.com/overlay/{slug}`
-3. Set dimensions: **1920 x 1080**
-4. Enable "Refresh browser when scene becomes active" (optional)
+POST /api/drops/:slug/confirm-fee-config
 
-## API Endpoints
+POST /api/drops/:slug/create-launch-tx
 
-### Authentication
-- `GET /api/auth/nonce?walletPubkey=...` - Get sign message
-- `POST /api/auth/verify` - Verify signature, create session
-- `POST /api/auth/logout` - Clear session
-- `GET /api/auth/me` - Get current user
+POST /api/drops/:slug/confirm-launch
 
-### Drops (Authenticated)
-- `GET /api/drops` - List user's drops
-- `GET /api/drops/:slug` - Get drop details
-- `POST /api/drops` - Create new drop
-- `POST /api/drops/:slug/create-token-info` - Step 1: Create token
-- `POST /api/drops/:slug/create-fee-config` - Step 2: Get config transactions
-- `POST /api/drops/:slug/confirm-fee-config` - Confirm config created
-- `POST /api/drops/:slug/create-launch-tx` - Step 3: Get launch transaction
-- `POST /api/drops/:slug/confirm-launch` - Confirm launched
-- `GET /api/drops/:slug/claimable` - Get claimable positions
-- `POST /api/drops/:slug/claim` - Get claim transactions
-- `POST /api/drops/:slug/confirm-claim` - Record successful claim
+GET /api/drops/:slug/claimable
 
-### Viewer (Public)
-- `GET /api/viewer/:slug` - Get drop info for viewers
-- `POST /api/viewer/:slug/check-holding` - Check token balance
-- `POST /api/viewer/:slug/tts` - Submit TTS message
-- `POST /api/viewer/:slug/vote` - Submit vote
+POST /api/drops/:slug/claim
 
-### Overlay (Public)
-- `GET /api/overlay/:slug` - Get overlay data
-- `WS /ws/overlay/:slug` - WebSocket for real-time updates
+POST /api/drops/:slug/confirm-claim
 
-### Health
-- `GET /health` - Basic health check
-- `GET /health/detailed` - Detailed health check
+Viewer (public)
 
-## Security
+GET /api/viewer/:slug
 
-### ⚠️ Important Security Notes
+POST /api/viewer/:slug/check-holding
 
-1. **Use a Dedicated Wallet**: Do NOT use your main wallet for streaming. Create a dedicated "streamer wallet" with only the SOL needed for launches.
+POST /api/viewer/:slug/tts
 
-2. **Prize Pool Wallet**: Similarly, use a dedicated wallet for the prize pool.
+POST /api/viewer/:slug/vote
 
-3. **Private Keys**: This application NEVER stores or requests private keys. All signing happens in your browser wallet (Phantom/Solflare).
+Overlay (public)
 
-4. **API Key**: The Bags API key is only used server-side and never exposed to clients.
+GET /api/overlay/:slug
 
-### Session Security
+WS /ws/overlay/:slug
 
-- Sessions are stored in SQLite with hashed tokens
-- Cookies are httpOnly, secure (in production), and sameSite=lax
-- Sessions expire after 7 days
-- Signature verification uses tweetnacl
+Health
 
-### Rate Limiting
+GET /health
 
-- Login endpoints: 10 requests per minute per IP
-- Action endpoints: 20 requests per minute per wallet/IP
-- Bags API: Built-in backoff on 429 responses
+GET /health/detailed
 
-### Input Validation
+Configuration
+Fee split
 
-- All wallet addresses validated as valid base58 PublicKeys
-- TTS messages sanitized (URL removal, profanity filter, length limits)
-- Zod schemas for all API inputs
+Fee split is stored as basis points and must sum to 10,000:
 
-## Configuration
+streamerBps: 5000 = 50%
 
-### Environment Variables
+prizePoolBps: 5000 = 50%
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `BAGS_API_KEY` | Bags API key (required) | - |
-| `SOLANA_RPC_URL` | Solana RPC endpoint | - |
-| `APP_ORIGIN` | Public URL of the app | - |
-| `PORT` | Server port | `3000` |
-| `DATABASE_URL` | SQLite database path | `file:./dev.db` |
-| `NODE_ENV` | Environment | `development` |
-| `SESSION_COOKIE_NAME` | Cookie name | `livedrops_session` |
-| `SESSION_EXPIRY_HOURS` | Session lifetime | `168` (7 days) |
-| `TOKEN_BALANCE_CACHE_SECONDS` | Balance cache TTL | `15` |
-| `MAX_TTS_MESSAGE_LENGTH` | Max TTS length | `200` |
+Holding threshold
 
-### Fee Configuration
+holderThresholdRaw is stored in base units (raw token amount). For a token with 6 decimals:
 
-Default fee split is 50/50 between streamer and prize pool. This is configurable when creating a drop:
-- `streamerBps`: Streamer's percentage in basis points (5000 = 50%)
-- `prizePoolBps`: Prize pool's percentage in basis points (5000 = 50%)
-- Total must equal 10000 (100%)
+1 token = 1,000,000
 
-### Holder Threshold
+1000 tokens = 1,000,000,000
 
-Configure the minimum token balance required for interactions:
-- `holderThresholdRaw`: Raw token amount in base units
-- For a token with 6 decimals: `1000000` = 1 token
+If you change token decimals, you must ensure the UI and threshold units remain consistent.
 
-## Database
+Security notes
 
-SQLite is used for simplicity and single-file deployment. Tables:
+Use a dedicated streamer wallet. Do not use your main wallet.
 
-- **User**: Wallet addresses
-- **Session**: Active sessions with hashed tokens
-- **Drop**: Token launches with status tracking
-- **Action**: TTS messages and votes
-- **Claim**: Fee claim records
-- **Poll**: Active polls for voting
+No private keys are stored. All signing is done in the browser via the connected wallet.
 
-## Troubleshooting
+Bags API key stays server-side. It is never exposed to the client.
 
-### "Failed to create token info"
-- Check that your Bags API key is valid
-- Ensure image URL is accessible
+Session tokens are hashed at rest. Cookies are httpOnly and sameSite=lax (and secure in production).
 
-### "Transaction failed"
-- Make sure you have enough SOL for transaction fees
-- Check that you're on mainnet (not devnet)
+Rate limiting and input validation are enforced on authentication and viewer action routes. Viewer messages are sanitized and length-limited.
 
-### WebSocket not connecting
-- Verify the APP_ORIGIN matches your actual domain
-- Check for CORS issues in browser console
+Troubleshooting
+“Failed to create token info”
 
-### Session expired
-- Clear cookies and reconnect wallet
-- Check SESSION_EXPIRY_HOURS setting
+Confirm your Bags API key is valid.
 
-## Testing Checklist
+Ensure the image URL (if used) is publicly accessible.
 
-- [ ] Creator can login with wallet signature
-- [ ] Creator can create a drop with all fields
-- [ ] Creator can click "Create Token Info" and it stores tokenMint
-- [ ] Creator can click "Create Fee Config", sign tx(s), and it stores configKey
-- [ ] Creator can click "Launch", sign tx, and status becomes LAUNCHED
-- [ ] Viewer page enforces holding threshold correctly
-- [ ] Overlay updates in real time when viewer submits TTS
-- [ ] Poll votes update in real time on overlay
-- [ ] Creator can generate and submit claim transactions
+Check API logs for the Bags response body.
 
-## License
+“Transaction failed”
+
+Ensure the signing wallet has enough SOL for fees.
+
+Confirm your RPC is healthy and on mainnet.
+
+Check the transaction signature on a Solana explorer.
+
+Overlay is not updating
+
+Confirm the WebSocket endpoint is reachable.
+
+Check browser console for CORS or mixed-content issues (http vs https).
+
+Ensure the overlay URL uses the same domain as your server in production.
+
+Test checklist
+
+Creator can sign in with wallet signature.
+
+Creator can create a drop and configure fee split + threshold.
+
+Token info creation stores tokenMint and tokenMetadataUrl.
+
+Fee config step returns tx(s), wallet signs, config is persisted.
+
+Launch step returns tx, wallet signs, drop becomes LAUNCHED.
+
+Viewer gating blocks actions below threshold and allows above threshold.
+
+Overlay receives actions in real time.
+
+Claim flow generates claim tx(s) and records claim signatures.
+
+License
 
 MIT
-
-## Support
-
-For issues with the Bags API, visit [dev.bags.fm](https://dev.bags.fm).
-
-For issues with this application, open a GitHub issue.
